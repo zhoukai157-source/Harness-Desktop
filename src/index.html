@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DSH Desktop</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card">
+        <div class="brand">
+          <img class="logo" src="/assets/app-icon.png" alt="DeepSeek" width="84" height="84" />
+          <h1>DSH Desktop</h1>
+          <p class="subtitle">DeepSeek Harness · native macOS shell</p>
+        </div>
+
+        <div class="status" id="status" data-state="starting">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="status-text" id="status-text">Starting the engine…</span>
+        </div>
+
+        <div class="progress" id="progress" hidden>
+          <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
+          <div class="progress-text" id="progress-text"></div>
+        </div>
+
+        <div class="url-row" id="url-row" hidden>
+          <code id="url"></code>
+          <button class="ghost" id="open-browser" type="button">Open in browser</button>
+        </div>
+
+        <div class="error-box" id="error-box" hidden>
+          <p id="error-text"></p>
+          <button class="primary" id="retry" type="button">Retry</button>
+        </div>
+
+        <div class="row">
+          <button class="ghost" id="set-workspace" type="button">Set workspace folder…</button>
+        </div>
+
+        <footer>You can hide this window to the menu bar — it keeps running.</footer>
+      </section>
+    </main>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

@@ -23,3 +23,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+objc2 = { version = "0.6.4" }
+objc2-app-kit = { version = "0.3.2", features = ["block2"] }
+objc2-foundation = { version = "0.3.2" }
+block2 = { version = "0.6", features = ["alloc"] }

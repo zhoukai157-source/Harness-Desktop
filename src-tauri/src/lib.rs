@@ -29,6 +29,16 @@ use tauri::{
 };
 use tauri_plugin_opener::OpenerExt;
 
+// macOS paste-path bridging (objc2). Used to convert a Finder file copy into
+// plain path text when the user pastes with Cmd+V inside the DSH input box.
+use block2::RcBlock;
+use objc2_app_kit::{
+    NSEvent, NSEventMask, NSEventModifierFlags, NSPasteboard, NSPasteboardTypeFileURL,
+    NSPasteboardTypeString,
+};
+use objc2_foundation::{NSString, NSURL};
+use std::ptr::NonNull;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -108,9 +118,12 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-/// Timestamped diagnostic logger (seconds since app start).
+/// Timestamped diagnostic logger (seconds since app start). Flushes so logs
+/// survive redirects to a file (Rust's stdout is block-buffered otherwise).
 fn logf(msg: &str) {
+    use std::io::Write;
     println!("[{:.1}s] [dsh-desktop] {msg}", whole().elapsed().as_secs_f64());
+    let _ = std::io::stdout().flush();
 }
 fn whole() -> &'static std::time::Instant {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -641,11 +654,25 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<()> {
     let app_menu = SubmenuBuilder::new(app, "DSH Desktop")
         .items(&[&about, &services, &hide, &quit])
         .build()?;
+
+    // Standard Edit menu: without it, AppKit has no Cmd+C/X/V/A key
+    // equivalents and the WKWebView text fields won't accept copy/paste
+    // shortcuts (typing still works, but command shortcuts are swallowed).
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .item(&PredefinedMenuItem::undo(app, None)?)
+        .item(&PredefinedMenuItem::redo(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::cut(app, None)?)
+        .item(&PredefinedMenuItem::copy(app, None)?)
+        .item(&PredefinedMenuItem::paste(app, None)?)
+        .item(&PredefinedMenuItem::select_all(app, None)?)
+        .build()?;
+
     let engine_menu = SubmenuBuilder::new(app, "Engine")
         .items(&[&show, &open_browser, &set_workspace, &restart, &stop, &open_dsh_home])
         .build()?;
 
-    let menu = Menu::with_items(app, &[&app_menu, &engine_menu])?;
+    let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &engine_menu])?;
     app.set_menu(menu)?;
     Ok(())
 }
@@ -752,6 +779,125 @@ fn open_in_browser(app: AppHandle) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Paste file paths (macOS convenience)
+// ---------------------------------------------------------------------------
+// In Finder, Cmd+C on a file/folder puts a *file reference* on the pasteboard
+// (public.file-url), not text. Pasting that inside a web text field yields
+// nothing. We install a local NSEvent monitor for Cmd+V: if the pasteboard is
+// a "pure file copy" (files but no meaningful text), we rewrite the pasteboard
+// to the POSIX path(s) right before the normal paste action runs, so the DSH
+// input box receives the path as ordinary text. Plain-text copies are untouched.
+
+const KEY_V: u16 = 9; // kVK_ANSI_V
+
+/// extern statics are unsafe to read; these bind the pasteboard type constants
+/// used below into plain references.
+fn paste_type_file_url() -> &'static NSString {
+    unsafe { &*NSPasteboardTypeFileURL }
+}
+fn paste_type_string() -> &'static NSString {
+    unsafe { &*NSPasteboardTypeString }
+}
+
+/// Read every file URL off the general pasteboard, returning POSIX paths.
+fn pasteboard_paths() -> Vec<String> {
+    let pb = NSPasteboard::generalPasteboard();
+    let items = match pb.pasteboardItems() {
+        Some(items) => items,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in items.iter() {
+        if let Some(url) = item.stringForType(paste_type_file_url()) {
+            if let Some(path) = file_url_to_path(&url.to_string()) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// True when the pasteboard holds a Finder-style file copy: at least one file
+/// URL, and any plain text is just the file name(s). Finder copies always
+/// include the basename as text, so we match that instead of demanding "no
+/// text at all".
+fn is_file_copy() -> bool {
+    let paths = pasteboard_paths();
+    if paths.is_empty() {
+        return false;
+    }
+    let pb = NSPasteboard::generalPasteboard();
+    if let Some(text) = pb.stringForType(paste_type_string()) {
+        let t = text.to_string();
+        let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if !lines.is_empty() {
+            let bases: Vec<&str> = paths
+                .iter()
+                .map(|p| p.rsplit('/').next().unwrap_or(""))
+                .collect();
+            let all_are_names = lines.iter().all(|l| bases.contains(l));
+            if !all_are_names {
+                return false; // real text content present → normal paste
+            }
+        }
+    }
+    true
+}
+
+/// Resolve a pasteboard file URL to its real POSIX path via NSURL.
+/// Handles plain "file:///…" URLs AND the opaque "file:///.file/id=…"
+/// file-reference URLs that some copies (browser, apps) store — NSURL.path
+/// resolves both, with percent-decoding included.
+fn file_url_to_path(url: &str) -> Option<String> {
+    let ns = NSURL::URLWithString(&NSString::from_str(url.trim()))?;
+    ns.path().map(|p| p.to_string())
+}
+
+/// Install an app-lifetime local monitor: on Cmd+V with a file-only copy,
+/// replace the pasteboard content with the paths so the webview pastes text.
+fn install_paste_path_monitor() {
+    let block: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+        RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            let event_ref = unsafe { event.as_ref() };
+            let is_cmd_v = event_ref.keyCode() == KEY_V
+                && event_ref.modifierFlags().contains(NSEventModifierFlags::Command);
+            if is_cmd_v {
+                if is_file_copy() {
+                    let paths = pasteboard_paths();
+                    if !paths.is_empty() {
+                        let text = if paths.len() == 1 {
+                            paths[0].clone()
+                        } else {
+                            paths.join("\n")
+                        };
+                        let pb = NSPasteboard::generalPasteboard();
+                        pb.clearContents();
+                        let _ =
+                            pb.setString_forType(&NSString::from_str(&text), paste_type_string());
+                        logf(&format!(
+                            "paste-path: injected {} path(s): {}",
+                            paths.len(),
+                            text
+                        ));
+                    }
+                } else {
+                    logf("paste-path: Cmd+V seen but pasteboard is NOT a file copy");
+                }
+            }
+            event.as_ptr() // return the event: paste proceeds as usual
+        });
+
+    // The returned opaque token keeps the monitor installed for the lifetime
+    // of the process; we intentionally leak it.
+    let token = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block)
+    };
+    std::mem::forget(token);
+    logf("paste-path: Cmd+V monitor installed (Finder file copies paste as paths)");
+}
+
+// ---------------------------------------------------------------------------
 // App entry
 // ---------------------------------------------------------------------------
 
@@ -791,6 +937,9 @@ pub fn run() {
 
             build_app_menu(handle)?;
             build_tray(handle)?;
+
+            // Finder-copy → path-text bridging for the DSH input box.
+            install_paste_path_monitor();
 
             // Ask macOS for notification permission up front (clean first run).
             use tauri_plugin_notification::NotificationExt;

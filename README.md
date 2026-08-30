@@ -46,7 +46,9 @@
 - ✅ **窗口关闭 → 缩到托盘**：点是关不掉 App，继续后台运行
 - ✅ **优雅关停**：Quit 时对引擎进程组发 SIGTERM（超时再 SIGKILL），不留孤儿进程/端口
 - ✅ **工作区选择**：托盘 "Set Workspace Folder…" 换工作目录后原地重启引擎（DSH 里也可以在界面内切换工作区）
-- ✅ **图标**：DeepSeek 官方 App 图标（圆角透明蒙版，Dock/Finder 都是标准的圆角形态）
+- ✅ **图标**：DeepSeek 鲸鱼 logo（自绘，Dock/Finder 圆角形态）
+- ✅ **粘贴文件/文件夹路径**：在 Finder 里复制文件或文件夹后，回到聊天输入框直接 `Cmd+V`，粘出来的就是它的**绝对路径**（原生监听 Cmd+V，检测到"文件拷贝"时自动把剪贴板改写成路径文本；支持 `file:///.file/id=` 引用解析）
+- ✅ **标准 Edit 菜单**：Undo/Redo/Cut/Copy/Paste/Select All —— 保证 Cmd+A/C/V/X 在 WebView 的输入框里正常工作
 
 ---
 

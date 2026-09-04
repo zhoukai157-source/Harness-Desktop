@@ -161,6 +161,55 @@ fn engine_port(state: &AppState) -> u16 {
     state.engine.lock().unwrap().port.unwrap_or(DESKTOP_PORT)
 }
 
+/// Inject the DSH auth cookie into the system cookie store so WKWebView
+/// includes it when navigating to the engine URL. New DSH versions authenticate
+/// via a URL token that sets an HttpOnly cookie via a303 redirect; WKWebView
+/// doesn't always follow this chain correctly, so we set the cookie directly.
+fn inject_auth_cookie(port: u16, token_url: &str) {
+    let token = match token_url.split("token=").nth(1) {
+        Some(t) => t.split('&').next().unwrap_or(""),
+        None => return,
+    };
+    if token.is_empty() { return; }
+
+    // 1) Hit the token URL to get the Set-Cookie header.
+    let (status, body) = match http_get(port, "/", Some(token)) {
+        Some(r) => r,
+        None => return,
+    };
+    if status != 303 { return; }
+
+    // 2) Build an NSDictionary of response headers (just the Set-Cookie line).
+    let body_str = String::from_utf8_lossy(&body);
+    let mut set_cookie = String::new();
+    for line in body_str.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("set-cookie:") {
+            set_cookie = line.strip_prefix("set-cookie:").unwrap_or(line).trim().to_string();
+            break;
+        }
+    }
+    if set_cookie.is_empty() { return; }
+
+    // 3) Use NSHTTPCookie::cookiesWithResponseHeaderFields_forURL to parse.
+    let base_url = format!("http://127.0.0.1:{port}/");
+    unsafe {
+        use objc2_foundation::{NSHTTPCookie, NSHTTPCookieStorage, NSDictionary, NSString, NSURL};
+        let key = NSString::from_str("Set-Cookie");
+        let val = NSString::from_str(&set_cookie);
+        let headers = NSDictionary::from_slices(&[&*key], &[&*val]);
+        let url = NSURL::URLWithString(&NSString::from_str(&base_url));
+        if let Some(u) = url {
+            let cookies = NSHTTPCookie::cookiesWithResponseHeaderFields_forURL(&headers, &u);
+            if cookies.count() > 0 {
+                let storage = NSHTTPCookieStorage::sharedHTTPCookieStorage();
+                storage.setCookies_forURL_mainDocumentURL(&cookies, Some(&u), Some(&u));
+                logf(&format!("inject_auth_cookie: stored {} cookie(s)", cookies.count()));
+            }
+        }
+    }
+}
+
 fn navigate_main(app: &AppHandle, url: &str) {
     if let Some(win) = app.get_webview_window("main") {
         if let Ok(parsed) = url.parse() {
@@ -618,9 +667,11 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
     }
     spawn_watchdog(app, port);
 
-    // Navigate using the full token_url when available.
+    // Inject auth cookie BEFORE navigation so WKWebView includes it.
+    inject_auth_cookie(port, &token_url);
+
     let navigate_url = if !token_url.is_empty() {
-        token_url.clone()
+        format!("http://127.0.0.1:{port}/")
     } else {
         url.clone()
     };

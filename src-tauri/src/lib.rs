@@ -67,6 +67,7 @@ struct EngineInfo {
     pid: Option<u32>,
     workspace: String,
     detail: Option<String>,
+    token_url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -83,6 +84,7 @@ struct Engine {
     mode: String, // "standalone" | "attached" | "stopped"
     port: Option<u16>,
     url: Option<String>,
+    token_url: Option<String>,
     manual_stop: bool,
 }
 
@@ -196,6 +198,7 @@ fn snapshot_info(state: &AppState) -> EngineInfo {
         pid: engine.child.as_ref().map(|c| c.id()),
         workspace: settings.workspace_dir().display().to_string(),
         detail: None,
+        token_url: engine.token_url.clone(),
     }
 }
 
@@ -247,13 +250,26 @@ fn find_dsh() -> Option<PathBuf> {
 // Minimal loopback HTTP probing (no extra dependency)
 // ---------------------------------------------------------------------------
 
-/// Synchronous GET `path` on 127.0.0.1:`port`. Returns (status, body) on
-/// success, `None` when nothing answers or the read fails.
-fn http_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
+/// Synchronous GET `path` on 127.0.0.1:`port`, optionally appending a
+/// `?token=xxx` query string. Returns (status, body) on success, `None`
+/// when nothing answers or the read fails.
+fn http_get(port: u16, path: &str, token: Option<&str>) -> Option<(u16, Vec<u8>)> {
     let addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect_timeout(&addr.parse().ok()?, PROBE_TIMEOUT).ok()?;
     let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let full_path = match token {
+        Some(t) if !t.is_empty() => {
+            if path.contains('?') {
+                format!("{path}&token={t}")
+            } else {
+                format!("{path}?token={t}")
+            }
+        }
+        _ => path.to_string(),
+    };
+    let req = format!(
+        "GET {full_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).ok()?;
     let mut body = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -269,7 +285,8 @@ fn http_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
 }
 
 fn server_up(port: u16) -> bool {
-    matches!(http_get(port, "/"), Some((200, _)))
+    http_get(port, "/", None)
+        .is_some_and(|(s, _)| s == 200 || s == 401)
 }
 
 fn looks_like_dsh(body: &[u8]) -> bool {
@@ -277,8 +294,13 @@ fn looks_like_dsh(body: &[u8]) -> bool {
     head.contains("__DSH_BOOT__") || head.contains("DeepSeek Harness")
 }
 
+/// Whether the server on `port` is a DSH instance. Auth-gated servers (401)
+/// are accepted without body inspection.
 fn is_dsh(port: u16) -> bool {
-    matches!(http_get(port, "/"), Some((200, ref b)) if looks_like_dsh(b))
+    if let Some((status, body)) = http_get(port, "/", None) {
+        return status == 401 || (status == 200 && looks_like_dsh(&body));
+    }
+    false
 }
 
 /// True when something is already bound to `port` on loopback.
@@ -298,14 +320,11 @@ fn next_free_port(start: u16) -> Option<u16> {
 // Engine process management
 // ---------------------------------------------------------------------------
 
-fn spawn_engine(app: &AppHandle, port: u16, cwd: &PathBuf) -> Result<Child, String> {
+fn spawn_engine(app: &AppHandle, port: u16, cwd: &PathBuf) -> Result<(Child, String), String> {
     if !cwd.is_dir() {
         return Err(format!("workspace folder does not exist: {}", cwd.display()));
     }
 
-    // The app requires `dsh` to be installed (like an ordinary `dsh web` run).
-    // We deliberately do NOT download/install it from inside the app — users
-    // install DeepSeek Harness on their own, and this app just finds it.
     let dsh = find_dsh().ok_or_else(|| {
         "DeepSeek Harness (`dsh`) is not installed on this machine.\n\n\
          Install it once, then reopen this app:\n\
@@ -319,15 +338,11 @@ fn spawn_engine(app: &AppHandle, port: u16, cwd: &PathBuf) -> Result<Child, Stri
     cmd.current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Own process group so we can signal the whole tree (DSH subprocesses)
-    // with a single SIGTERM/SIGKILL.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    // Dev/test hook: allow an isolated DSH_HOME so a standalone run never
-    // touches a live `dsh web` store. Inherits the parent env otherwise.
     if let Ok(alt) = std::env::var("DSH_DESKTOP_HOME") {
         let home = home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let resolved = if alt.starts_with('/') { PathBuf::from(&alt) } else { home.join(&alt) };
@@ -338,16 +353,38 @@ fn spawn_engine(app: &AppHandle, port: u16, cwd: &PathBuf) -> Result<Child, Stri
         .spawn()
         .map_err(|e| format!("failed to launch the dsh engine: {e}"))?;
 
-    drain_pipes(child.stdout.take(), "dsh:out");
+    // Capture stdout to parse the token URL that new dsh versions print.
+    // Also forward lines to our own stdout for debugging.
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(stream) = stdout {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                println!("[dsh:out] {line}");
+                if let Some(url) = parse_dsh_url(&line) {
+                    let _ = tx.send(url);
+                }
+            }
+        });
+    }
     drain_pipes(child.stderr.take(), "dsh:err");
 
-    // Poll until the server answers; fail fast if the child exits early.
     emit_status(app, "starting", Some(format!("booting engine on port {port}…")), None);
     logf(&format!("spawn_engine: child_pid={}", child.id()));
     let start = Instant::now();
     while start.elapsed() < BOOT_TIMEOUT {
+        // Drain any token URL the stdout capture thread found.
+        let mut tok = None;
+        while let Ok(t) = rx.try_recv() {
+            tok = Some(t);
+        }
+        if let Some(ref t) = tok {
+            logf(&format!("spawn_engine: token_url captured ({})", t.len()));
+        }
+
         if server_up(port) {
-            return Ok(child);
+            let token_url = tok.unwrap_or_default();
+            return Ok((child, token_url));
         }
         if let Ok(Some(status)) = child.try_wait() {
             let _ = child.kill();
@@ -363,6 +400,19 @@ fn spawn_engine(app: &AppHandle, port: u16, cwd: &PathBuf) -> Result<Child, Stri
          Check that `dsh web` works from a terminal.",
         BOOT_TIMEOUT.as_secs()
     ))
+}
+
+/// Parse a `dsh web: http://127.0.0.1:<port>/?token=<token>` line.
+/// Returns the full URL string including the token query parameter.
+fn parse_dsh_url(line: &str) -> Option<String> {
+    let line = line.trim();
+    let rest = line.strip_prefix("dsh web:").or_else(|| line.strip_prefix("dsh:"))?;
+    let url = rest.trim();
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_string())
+    } else {
+        None
+    }
 }
 
 /// Forward engine stdout/stderr lines to our own stdout (visible when running
@@ -449,19 +499,31 @@ fn action_stop_engine(app: &AppHandle) {
     }
     engine.mode = "stopped".to_string();
     engine.url = None;
+    engine.token_url = None;
     engine.port = None;
     drop(engine);
     logf("engine stopped (manual stop)");
     emit_status(app, "stopped", Some("engine stopped".to_string()), None);
 }
 
-fn action_attach(app: &AppHandle, port: u16) -> EngineInfo {
+fn action_attach(app: &AppHandle, port: u16) -> Result<EngineInfo, String> {
+    // With new auth-gated DSH, we cannot navigate to an existing engine without
+    // the token. Probe whether it's accessible (200) or requires auth (401).
+    if let Some((status, _)) = http_get(port, "/", None) {
+        if status == 401 {
+            return Err(format!(
+                "a DSH engine is running on port {port} but requires authentication. \
+                 Close it and reopen DSH Desktop to start a fresh engine with a token."
+            ));
+        }
+    }
     let state = app.state::<AppState>();
     {
         let mut engine = state.engine.lock().unwrap();
         engine.mode = "attached".to_string();
         engine.port = Some(port);
         engine.url = Some(engine_url(port));
+        engine.token_url = None;
         engine.child = None;
     }
     let url = engine_url(port);
@@ -473,7 +535,7 @@ fn action_attach(app: &AppHandle, port: u16) -> EngineInfo {
         Some(url.clone()),
     );
     navigate_main(app, &url);
-    snapshot_info(&state)
+    Ok(snapshot_info(&state))
 }
 
 fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
@@ -501,14 +563,16 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
             let port = engine_port(&state);
             let _ = healthy;
             let settings = state.settings.lock().unwrap();
+            let engine = state.engine.lock().unwrap();
             return Ok(EngineInfo {
                 status: "ready".to_string(),
                 mode: "standalone".to_string(),
-                url: Some(engine_url(port)),
+                url: engine.token_url.clone().or(Some(engine_url(port))),
                 port: Some(port),
                 pid: None,
                 workspace: settings.workspace_dir().display().to_string(),
                 detail: None,
+                token_url: engine.token_url.clone(),
             });
         }
     }
@@ -516,7 +580,10 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
     // 2) A DSH server already owns the canonical port → attach to it.
     let no_attach = std::env::var("DSH_DESKTOP_NO_ATTACH").is_ok();
     if !no_attach && is_dsh(CANONICAL_PORT) {
-        return Ok(action_attach(app, CANONICAL_PORT));
+        match action_attach(app, CANONICAL_PORT) {
+            Ok(info) => return Ok(info),
+            Err(e) => logf(&format!("attach failed ({e}), falling back to standalone")),
+        }
     }
 
     // 3) Spawn our own engine on the preferred (or next free) port.
@@ -536,7 +603,7 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
     };
 
     println!("[dsh-desktop] spawning engine on port {port}, cwd: {}", cwd.display());
-    let child = spawn_engine(app, port, &cwd)?;
+    let (child, token_url) = spawn_engine(app, port, &cwd)?;
     logf(&format!("engine ready, pid {}", child.id()));
     let pid = child.id();
     let url = engine_url(port);
@@ -546,12 +613,19 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
         engine.mode = "standalone".to_string();
         engine.port = Some(port);
         engine.url = Some(url.clone());
+        engine.token_url = Some(token_url.clone());
         engine.manual_stop = false;
     }
     spawn_watchdog(app, port);
 
+    // Navigate using the full token_url when available.
+    let navigate_url = if !token_url.is_empty() {
+        token_url.clone()
+    } else {
+        url.clone()
+    };
     emit_status(app, "ready", Some("engine ready".to_string()), Some(url.clone()));
-    navigate_main(app, &url);
+    navigate_main(app, &navigate_url);
     let mut info = snapshot_info(&state);
     info.pid = Some(pid);
     Ok(info)

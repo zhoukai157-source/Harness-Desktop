@@ -8,6 +8,8 @@
 > *Unofficial community desktop client. Not affiliated with or endorsed by DeepSeek. "DeepSeek" and its logo are trademarks of their respective owner, used here only to identify the product this app wraps.*
 
 > 原理：DSH 的核心就是"一个本地 Node 服务 + 一个已预构建的 SPA"。所以桌面端**没有重写任何 AI 引擎**——它只是一个原生外壳，负责拉起/接管同一个引擎，并把窗口导航过去。你看到的**就是同一个 DeepSeek Harness**，功能 100% 一致。
+>
+> **认证 token**：新版 DSH 启动时需要认证（`dsh web` 在 stdout 输出带 token 的完整 URL）。桌面端自动捕获该 token 并带 token 导航。附加模式下若已有引擎需要 token，则自动 fallback 到独立启动。
 
 ---
 
@@ -32,8 +34,9 @@
 
 | 情况 | 行为 |
 |---|---|
-| `127.0.0.1:3080` 上已有 DSH 在服务 | **附加模式**：不新起进程，直接把窗口指向它（同一份数据，另一扇窗）。托盘"Stop Engine"不作用于外部进程。 |
-| 3080 空闲 | **自主模式**：桌面端在专有端口 **3480** 拉起 `dsh web --no-open --port 3480`（若被占用则顺延找空闲端口）。 |
+| `127.0.0.1:3080` 上已有 DSH 在服务且无认证 | **附加模式**：不新起进程，直接把窗口指向它（同一份数据，另一扇窗）。托盘"Stop Engine"不作用于外部进程。 |
+| 3080 上的 DSH 需要认证 token | 自动 fallback 到**自主模式**（无法获取已有引擎的 token） |
+| 3080 空闲 | **自主模式**：桌面端在专有端口 **3480** 拉起 `dsh web --no-open --port 3480`（若被占用则顺延找空闲端口）。捕获 token URL 并带 token 导航。 |
 
 两种模式共用同一个 `$DSH_HOME`（默认 `~/.dsh`），所以模型设置、会话、凭据都和你平时的使用完全一致。**注意：不要同时手动再开一个 `dsh web` 共享同一份 `~/.dsh`**（同一套数据最好单实例）。
 

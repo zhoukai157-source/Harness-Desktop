@@ -161,60 +161,113 @@ fn engine_port(state: &AppState) -> u16 {
     state.engine.lock().unwrap().port.unwrap_or(DESKTOP_PORT)
 }
 
-/// Set the DSH auth cookie on the WKWebView's own cookie store
-/// (WKHTTPCookieStore). New DSH versions authenticate via a URL token that the
-/// server trades for an HttpOnly cookie; WKWebView keeps cookies in its own
-/// process-local store, so setting NSHTTPCookieStorage alone is not enough —
-/// we must write directly into the webview's WKHTTPCookieStore.
-fn inject_auth_cookie(app: &AppHandle, port: u16, token_url: &str) {
-    let token = match token_url.split("token=").nth(1) {
-        Some(t) => t.split('&').next().unwrap_or(""),
-        None => return,
-    };
-    if token.is_empty() { return; }
+/// Obtain the DSH auth cookie's `Name=Value` by performing the token exchange
+/// over plain HTTP (GET /?token=… → 303 + Set-Cookie). Returns just the first
+/// attribute pair, e.g. `dsh-auth-xxx=v1….JWT`.
+///
+/// WKWebView drops Set-Cookie from 3xx redirects, so the webview itself can't
+/// obtain the cookie; we fetch it here and then write it from JS on the
+/// engine's own origin (see action_start).
+fn fetch_auth_cookie_name_value(port: u16, token_url: &str) -> Option<String> {
+    let token = token_url.split("token=").nth(1)?.split('&').next().unwrap_or("");
+    if token.is_empty() { return None; }
 
-    // 1) Hit the token URL to obtain the Set-Cookie header.
-    let (status, body) = match http_get(port, "/", Some(token)) {
-        Some(r) => r,
-        None => return,
-    };
-    if status != 303 { return; }
+    let (status, body) = http_get(port, "/", Some(token))?;
+    if status != 303 { logf(&format!("auth exchange: unexpected status {status}")); return None; }
 
-    // 2) Extract the Set-Cookie header value.
     let body_str = String::from_utf8_lossy(&body);
-    let mut set_cookie = String::new();
     for line in body_str.lines() {
         if line.to_lowercase().starts_with("set-cookie:") {
-            set_cookie = line
-                .strip_prefix("set-cookie:")
-                .unwrap_or(line)
-                .trim()
-                .to_string();
+            let value = line.trim_start().strip_prefix("set-cookie:").unwrap_or("").trim();
+            if let Some(nv) = value.split(';').next() {
+                if !nv.trim().is_empty() {
+                    return Some(nv.trim().to_string());
+                }
+            }
             break;
         }
     }
-    if set_cookie.is_empty() { return; }
+    None
+}
 
-    // 3) Write the cookie into the WKWebView's own cookie store.
-    let base_url = format!("http://127.0.0.1:{port}/");
+/// Load a URL in the webview by directly calling WKWebView.loadRequest through
+/// with_webview. More reliable than tauri's WebviewWindow::navigate (which
+/// silently fails to commit the load when called from a background thread).
+fn webview_load_url(app: &AppHandle, url: &str) {
+    if let Some(win) = app.get_webview_window("main") {
+        use objc2_foundation::{NSURL, NSURLRequest, NSString};
+        let url_string = url.to_string();
+        let _ = win.with_webview(move |webview| {
+            unsafe {
+                use objc2_web_kit::WKWebView;
+                let wv = &*(webview.inner() as *mut WKWebView);
+                if let Some(u) = NSURL::URLWithString(&NSString::from_str(&url_string)) {
+                    let req = NSURLRequest::requestWithURL(&u);
+                    wv.loadRequest(&req);
+                    logf(&format!("webview_load_url: loaded {url_string}"));
+                }
+            }
+        });
+    }
+}
+
+/// Fire-and-forget JS execution on the committed page using the raw
+/// WKWebView.evaluateJavaScript path. Logs whether the script executed or
+/// threw.
+fn eval_fire(app: &AppHandle, label: &str, js: &str) {
+    if let Some(win) = app.get_webview_window("main") {
+        let script = js.to_string();
+        let label = label.to_string();
+        use block2::RcBlock;
+        let _ = win.with_webview(move |webview| {
+            unsafe {
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::{NSError, NSString};
+                use objc2_web_kit::WKWebView;
+                let wv = &*(webview.inner() as *mut WKWebView);
+                let s = NSString::from_str(&script);
+                let block = RcBlock::new(move |_result: *mut AnyObject, err: *mut NSError| {
+                    if !err.is_null() {
+                        logf(&format!("[eval] {label}: THREW"));
+                    } else {
+                        logf(&format!("[eval] {label}: ran"));
+                    }
+                });
+                wv.evaluateJavaScript_completionHandler(&s, Some(&*block));
+            }
+        });
+    }
+}
+
+/// Diagnostic: read back what the webview is actually displaying (title +
+/// first bit of body text) and log it. Lets us verify auth worked without
+/// eyeballing the window.
+fn diag_page_content(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.with_webview(move |webview| {
             unsafe {
-                use objc2_foundation::{NSHTTPCookie, NSDictionary, NSString, NSURL};
+                use block2::RcBlock;
+                use objc2::runtime::AnyObject;
+                use objc2_foundation::{NSError, NSString};
                 use objc2_web_kit::WKWebView;
                 let wv = &*(webview.inner() as *mut WKWebView);
-                let store = wv.configuration().websiteDataStore().httpCookieStore();
-                let key = NSString::from_str("Set-Cookie");
-                let val = NSString::from_str(&set_cookie);
-                let headers = NSDictionary::from_slices(&[&*key], &[&*val]);
-                let url = NSURL::URLWithString(&NSString::from_str(&base_url));
-                if let Some(u) = url {
-                    let cookies = NSHTTPCookie::cookiesWithResponseHeaderFields_forURL(&headers, &u);
-                    if let Some(cookie) = cookies.firstObject() {
-                        store.setCookie_completionHandler(&cookie, None);
-                        logf("inject_auth_cookie: set on WKHTTPCookieStore");
+                let script = NSString::from_str(
+                    "(document.title||'')+'|'+(document.body&&document.body.innerText||'').replace(/\\n/g,' ').slice(0,160)",
+                );
+                let block = RcBlock::new(move |result: *mut AnyObject, err: *mut NSError| {
+                    if !err.is_null() {
+                        logf("[diag] evaluateJavaScript error");
+                        return;
                     }
-                }
+                    if result.is_null() {
+                        logf("[diag] empty result");
+                        return;
+                    }
+                    let s = &*(result as *const NSString);
+                    let text = s.to_string();
+                    logf(&format!("[diag] page: {text}"));
+                });
+                wv.evaluateJavaScript_completionHandler(&script, Some(&*block));
             }
         });
     }
@@ -677,19 +730,59 @@ fn action_start(app: &AppHandle) -> Result<EngineInfo, String> {
     }
     spawn_watchdog(app, port);
 
-    // Inject auth cookie into the webview's own cookie store BEFORE navigation.
-    inject_auth_cookie(app, port, &token_url);
+    // Auth-token flow (DSH ≥ 0.1.2).
+    //
+    // Facts established by diagnosis:
+    //   * Sync tauri commands run on the MAIN thread; sleeping here would block
+    //     the event loop, so with_webview/eval/navigate messages would only be
+    //     processed after start_engine returns — hence the whole dance runs on
+    //     a background thread.
+    //   * WKWebView drops Set-Cookie from 3xx redirect responses, so DSH's
+    //     token→cookie 303 never yields an authenticated `/` on its own. We
+    //     fetch the cookie value ourselves and write it via document.cookie
+    //     (synchronous browser machinery) once the engine origin is committed,
+    //     then reload same-origin.
+    //
+    // Steps (all on a background thread):
+    //   1) loadRequest the token URL → 303 → commits the engine's 401 shell
+    //      (origin 127.0.0.1) as the document.
+    //   2) Wait for that commit.
+    //   3) document.cookie = '<name>=<value>; path=/' on that origin.
+    //   4) Same-origin reload → cookie attached → real DSH loads.
+    if !token_url.is_empty() {
+        let app2 = app.clone();
+        let token2 = token_url.clone();
+        std::thread::spawn(move || {
+            webview_load_url(&app2, &token2);
+            std::thread::sleep(Duration::from_millis(3000));
 
-    let navigate_url = if !token_url.is_empty() {
-        format!("http://127.0.0.1:{port}/")
+            if let Some(nv) = fetch_auth_cookie_name_value(port, &token2) {
+                let esc = nv.replace('\\', "\\\\").replace('\'', "\\'");
+                eval_fire(
+                    &app2,
+                    "cookie-write",
+                    &format!("document.cookie = '{esc}; path=/'; 'ok'"),
+                );
+                std::thread::sleep(Duration::from_millis(700));
+                eval_fire(&app2, "reload", "location.reload(); 'ok'");
+            } else {
+                logf("WEBV no cookie to write (auth exchange failed)");
+            }
+        });
     } else {
-        url.clone()
-    };
-    // The cookie is set asynchronously; give it a moment to hit the webview's
-    // cookie store before navigation so the request carries it.
-    std::thread::sleep(Duration::from_millis(400));
-    emit_status(app, "ready", Some("engine ready".to_string()), Some(url.clone()));
-    navigate_main(app, &navigate_url);
+        emit_status(app, "ready", Some("engine ready".to_string()), Some(url.clone()));
+        navigate_main(app, &url);
+    }
+
+    // Diagnostic: a few seconds later, log what the webview rendered so we can
+    // verify the auth cookie actually let DSH load (title/body text).
+    {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(12));
+            diag_page_content(&app2);
+        });
+    }
     let mut info = snapshot_info(&state);
     info.pid = Some(pid);
     Ok(info)

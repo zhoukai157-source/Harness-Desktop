@@ -26,4 +26,5 @@ libc = "0.2"
 objc2 = { version = "0.6.4" }
 objc2-app-kit = { version = "0.3.2", features = ["block2"] }
 objc2-foundation = { version = "0.3.2" }
+objc2-web-kit = { version = "0.3.2", features = ["block2"] }
 block2 = { version = "0.6", features = ["alloc"] }
